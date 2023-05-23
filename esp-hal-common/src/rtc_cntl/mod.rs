@@ -123,6 +123,8 @@ pub struct Rtc<'d> {
     pub swd: Swd,
 }
 
+const RTC_CLK_CAL_FRACT: u32 = 19;
+
 impl<'d> Rtc<'d> {
     pub fn new(rtc_cntl: impl Peripheral<P = RtcCntl> + 'd) -> Self {
         rtc::init();
@@ -188,6 +190,49 @@ impl<'d> Rtc<'d> {
     pub fn get_time_ms(&self) -> u64 {
         self.get_time_raw() * 1_000 / RtcClock::get_slow_freq().frequency().to_Hz() as u64
     }
+
+    #[cfg(esp32c3)]
+    pub fn deep_sleep(&self, time_in_us: u64) {
+        let rtc_cntl = unsafe { &*RTC_CNTL::PTR };
+
+        // enable power down digital core in sleep
+        rtc_cntl.dig_pwc.modify(|_, w| w.dg_wrap_pd_en().set_bit());
+
+        // 0x08 = RTC timer wakeup
+        rtc_cntl
+            .wakeup_state
+            .modify(|_, w| w.wakeup_ena().variant(0x8));
+
+        rtc_cntl.int_clr_rtc.write(|w| {
+            w.slp_reject_int_clr()
+                .set_bit()
+                .slp_wakeup_int_clr()
+                .set_bit()
+        });
+
+        let current_ticks = self.get_time_raw();
+
+        let rtc_slow_clk_divider = rtc_cntl.slow_clk_conf.read().bits() as u64;
+        let sleep_ticks =
+            ((time_in_us << RTC_CLK_CAL_FRACT) / rtc_slow_clk_divider) + current_ticks;
+
+        rtc_cntl.slp_timer0.write(|w| {
+            w.slp_val_lo()
+                .variant((sleep_ticks & u32::MAX as u64) as u32)
+        });
+        rtc_cntl.slp_timer1.modify(|_, w| {
+            w.slp_val_hi()
+                .variant(((sleep_ticks >> 32) & u16::MAX as u64) as u16)
+        });
+
+        rtc_cntl
+            .slp_timer1
+            .modify(|_, w| w.main_timer_alarm_en().set_bit());
+        unsafe {
+            rtc_cntl.int_clr_rtc.write(|w| w.bits(1 << 8));
+        }
+        rtc_cntl.state0.modify(|_, w| w.sleep_en().set_bit());
+    }
 }
 
 #[cfg(not(any(esp32c6, esp32h2)))]
@@ -197,8 +242,6 @@ pub struct RtcClock;
 #[cfg(not(any(esp32c6, esp32h2)))]
 /// RTC Watchdog Timer driver
 impl RtcClock {
-    const CAL_FRACT: u32 = 19;
-
     /// Enable or disable 8 MHz internal oscillator
     ///
     /// Output from 8 MHz internal oscillator is passed into a configurable
@@ -476,7 +519,7 @@ impl RtcClock {
     /// Measure ratio between XTAL frequency and RTC slow clock frequency
     fn get_calibration_ratio(cal_clk: RtcCalSel, slowclk_cycles: u32) -> u32 {
         let xtal_cycles = RtcClock::calibrate_internal(cal_clk, slowclk_cycles) as u64;
-        let ratio = (xtal_cycles << RtcClock::CAL_FRACT) / slowclk_cycles as u64;
+        let ratio = (xtal_cycles << RTC_CLK_CAL_FRACT) / slowclk_cycles as u64;
 
         (ratio & (u32::MAX as u64)) as u32
     }
@@ -492,7 +535,7 @@ impl RtcClock {
         let xtal_freq = RtcClock::get_xtal_freq();
         let xtal_cycles = RtcClock::calibrate_internal(cal_clk, slowclk_cycles) as u64;
         let divider = xtal_freq.mhz() as u64 * slowclk_cycles as u64;
-        let period_64 = ((xtal_cycles << RtcClock::CAL_FRACT) + divider / 2u64 - 1u64) / divider;
+        let period_64 = ((xtal_cycles << RTC_CLK_CAL_FRACT) + divider / 2u64 - 1u64) / divider;
 
         (period_64 & u32::MAX as u64) as u32
     }
@@ -510,7 +553,7 @@ impl RtcClock {
         );
 
         // 100_000_000 is used to get rid of `float` calculations
-        let period = (100_000_000 * period_13q19 as u64) / (1 << RtcClock::CAL_FRACT);
+        let period = (100_000_000 * period_13q19 as u64) / (1 << RTC_CLK_CAL_FRACT);
 
         (100_000_000 * 1000 / period) as u16
     }
@@ -532,7 +575,7 @@ impl RtcClock {
         let ratio = RtcClock::get_calibration_ratio(RtcCalSel::RtcCal8mD256, XTAL_FREQ_EST_CYCLES);
         let freq_mhz =
             ((ratio as u64 * RtcFastClock::RtcFastClock8m.hz() as u64 / 1_000_000u64 / 256u64)
-                >> RtcClock::CAL_FRACT) as u32;
+                >> RTC_CLK_CAL_FRACT) as u32;
 
         RtcClock::enable_8m(clk_8m_enabled, clk_8md256_enabled);
 
